@@ -7,6 +7,7 @@
 
 import os
 import sys
+import shutil
 sys.path.append(os.path.join(os.path.dirname(__file__), '../'))
 
 import torch
@@ -19,38 +20,47 @@ from PIL import Image
 from image_synthesis.utils.io import load_yaml_config
 from image_synthesis.modeling.build import build_model
 from image_synthesis.utils.misc import get_model_parameters_info
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--text', type=str, help='Tekstowy opis obrazu do wygenerowania')
+parser.add_argument('--truncation_rate', type=float, default=0.85, help='Współczynnik obcięcia próbkowania')
+parser.add_argument('--batch_size', type=int, default=4, help='Liczba obrazów w batchu')
+parser.add_argument('--fast', type=int, default=2, help='Parametr przyspieszenia (od 2 do 10)')
+parser.add_argument('--config', type=str, default='/kaggle/working/VQ-Diffusion/configs/coco.yaml', help='Ścieżka do configu')
+parser.add_argument('--weights', type=str, default='/kaggle/working/coco_pretrained.pth', help='Ścieżka do wag modelu')
+parser.add_argument('--save_root', type=str, default='RESULT', help='Folder zapisu wyników')
+
+args = parser.parse_args()
+
 
 class VQ_Diffusion():
-    def __init__(self, config, path, imagenet_cf=False):
-        self.info = self.get_model(ema=True, model_path=path, config_path=config, imagenet_cf=imagenet_cf)
+    def __init__(self, config, path):
+        self.info = self.get_model(ema=True, model_path=path, config_path=config)
         self.model = self.info['model']
         self.epoch = self.info['epoch']
         self.model_name = self.info['model_name']
         self.model = self.model.cuda()
         self.model.eval()
-        for param in self.model.parameters(): 
+        for param in self.model.parameters():
             param.requires_grad=False
 
-    def get_model(self, ema, model_path, config_path, imagenet_cf):
+    def get_model(self, ema, model_path, config_path):
+        import os
+        print("Current working dir:", config_path)
         if 'OUTPUT' in model_path: # pretrained model
             model_name = model_path.split(os.path.sep)[-3]
-        else: 
+        else:
             model_name = os.path.basename(config_path).replace('.yaml', '')
-
+        print(model_path)
         config = load_yaml_config(config_path)
-
-        if imagenet_cf:
-            config['model']['params']['diffusion_config']['params']['transformer_config']['params']['class_number'] = 1001
-
         model = build_model(config)
         model_parameters = get_model_parameters_info(model)
         
         print(model_parameters)
         if os.path.exists(model_path):
             ckpt = torch.load(model_path, map_location="cpu")
-        else:
-            print("Model path: {} does not exist.".format(model_path))
-            exit(0)
+
         if 'last_epoch' in ckpt:
             epoch = ckpt['last_epoch']
         elif 'epoch' in ckpt:
@@ -69,10 +79,8 @@ class VQ_Diffusion():
         
         return {'model': model, 'epoch': epoch, 'model_name': model_name, 'parameter': model_parameters}
 
-    def inference_generate_sample_with_class(self, text, truncation_rate, save_root, batch_size, infer_speed=False, guidance_scale=1.0):
+    def inference_generate_sample_with_class(self, text, truncation_rate, save_root, batch_size,fast=False):
         os.makedirs(save_root, exist_ok=True)
-
-        self.model.guidance_scale = guidance_scale
 
         data_i = {}
         data_i['label'] = [text]
@@ -103,13 +111,8 @@ class VQ_Diffusion():
             im = Image.fromarray(content[b])
             im.save(save_path)
 
-    def inference_generate_sample_with_condition(self, text, truncation_rate, save_root, batch_size, infer_speed=False, guidance_scale=1.0, prior_rule=0, prior_weight=0, learnable_cf=True):
+    def inference_generate_sample_with_condition(self, text, truncation_rate, save_root, batch_size,fast=False):
         os.makedirs(save_root, exist_ok=True)
-
-        self.model.guidance_scale = guidance_scale
-        self.model.learnable_cf = self.model.transformer.learnable_cf = learnable_cf # whether to use learnable classifier-free
-        self.model.transformer.prior_rule = prior_rule      # inference rule: 0 for VQ-Diffusion v1, 1 for only high-quality inference, 2 for purity prior
-        self.model.transformer.prior_weight = prior_weight  # probability adjust parameter, 'r' in Equation.11 of Improved VQ-Diffusion
 
         data_i = {}
         data_i['text'] = [text]
@@ -120,8 +123,8 @@ class VQ_Diffusion():
         save_root_ = os.path.join(save_root, str_cond)
         os.makedirs(save_root_, exist_ok=True)
 
-        if infer_speed != False:
-            add_string = 'r,time'+str(infer_speed)
+        if fast != False:
+            add_string = 'r,fast'+str(fast-1)
         else:
             add_string = 'r'
         with torch.no_grad():
@@ -146,56 +149,55 @@ class VQ_Diffusion():
 
 
 if __name__ == '__main__':
-    VQ_Diffusion_model = VQ_Diffusion(config='configs/ithq.yaml', path='OUTPUT/pretrained_model/ithq_learnable.pth')
+    captions_path = "/kaggle/working/fixed_captions.txt"
+    ids_path = "/kaggle/working/fixed_image_ids.txt"
+    output_dir = "/kaggle/working/output"
 
-    # Inference VQ-Diffusion
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("teddy bear playing in the pool", truncation_rate=0.86, save_root="RESULT", batch_size=4)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Inference Improved VQ-Diffusion with zero-shot classifier-free sampling
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("teddy bear playing in the pool", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0, learnable_cf=False)
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0, learnable_cf=False)
+    # Wczytanie opisów i ID
+    with open(captions_path, "r", encoding="utf-8") as f:
+        captions = [line.strip() for line in f if line.strip()]
 
-    # Inference Improved VQ-Diffusion with learnable classifier-free sampling
-    VQ_Diffusion_model.inference_generate_sample_with_condition("teddy bear playing in the pool", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0)
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0)
+    with open(ids_path, "r", encoding="utf-8") as f:
+        image_ids = [line.strip() for line in f if line.strip()]
 
-    # Inference Improved VQ-Diffusion with fast/high-quality inference
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=0.86, save_root="RESULT", batch_size=4, infer_speed=0.5) # high-quality inference, 0.5x inference speed
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=0.86, save_root="RESULT", batch_size=4, infer_speed=2) # fast inference, 2x inference speed
-    # infer_speed shoule be float in [0.1, 10], larger infer_speed means faster inference and smaller infer_speed means slower inference
+    if len(captions) != len(image_ids):
+        raise ValueError("Liczba opisów i ID nie jest taka sama!")
 
-    # Inference Improved VQ-Diffusion with purity sampling
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=0.86, save_root="RESULT", batch_size=4, prior_rule=2, prior_weight=1) # purity sampling
+    # Ładowanie modelu
+    VQ_Diffusion_model = VQ_Diffusion(
+        config='/kaggle/working/VQ-Diffusion/configs/coco.yaml',
+        path='/kaggle/working/coco_pretrained.pth'
+    )
 
-    # Inference Improved VQ-Diffusion with both learnable classifier-free sampling and fast inference
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("a long exposure photo of waterfall", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=5.0, infer_speed=2) # classifier-free guidance and fast inference
+    for idx, (caption, img_id) in enumerate(zip(captions, image_ids)):
+        if idx < 782:
+          continue
+        print(f"[{idx+1}/{len(captions)}] Generuję obrazy dla: '{caption}'")
 
+        # Ścieżka do folderu wynikowego
+        result_dir = f"/kaggle/working/VQ-Diffusion/RESULT/{caption}"
 
+        # Generowanie 5 obrazów
+        VQ_Diffusion_model.inference_generate_sample_with_condition(
+            caption,
+            truncation_rate=0.85,
+            save_root="/kaggle/working/VQ-Diffusion/RESULT",
+            batch_size=5,
+            fast=2
+        )
 
+        # Przenoszenie i zmiana nazw
+        if os.path.exists(result_dir):
+            files = sorted(os.listdir(result_dir))
+            for img_num, filename in enumerate(files):
+                src_path = os.path.join(result_dir, filename)
+                dst_filename = f"generated_{img_id}_{img_num}.png"
+                dst_path = os.path.join(output_dir, dst_filename)
+                shutil.move(src_path, dst_path)
 
-    # VQ_Diffusion_model = VQ_Diffusion(config='OUTPUT/pretrained_model/config_text.yaml', path='OUTPUT/pretrained_model/coco_learnable.pth')
-
-    # Inference VQ-Diffusion
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("A group of elephants walking in muddy water", truncation_rate=0.86, save_root="RESULT", batch_size=4)
-
-    # Inference Improved VQ-Diffusion with learnable classifier-free sampling
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("A group of elephants walking in muddy water", truncation_rate=1.0, save_root="RESULT", batch_size=4, guidance_scale=3.0)
-
-
-
-
-    # Inference Improved VQ-Diffusion with zero-shot classifier-free sampling: load models without classifier-free fine-tune and set guidance_scale to > 1
-    # VQ_Diffusion_model = VQ_Diffusion(config='OUTPUT/pretrained_model/config_text.yaml', path='OUTPUT/pretrained_model/coco_pretrained.pth')
-    # VQ_Diffusion_model.inference_generate_sample_with_condition("A group of elephants walking in muddy water", truncation_rate=0.86, save_root="RESULT", batch_size=4, guidance_scale=3.0, learnable_cf=False)
-
-
-
-
-    # Inference VQ-Diffusion
-    # VQ_Diffusion_model = VQ_Diffusion(config='OUTPUT/pretrained_model/config_imagenet.yaml', path='OUTPUT/pretrained_model/imagenet_pretrained.pth')
-    # VQ_Diffusion_model.inference_generate_sample_with_class(407, truncation_rate=0.86, save_root="RESULT", batch_size=4)
-
-
-    # Inference Improved VQ-Diffusion with classifier-free sampling
-    # VQ_Diffusion_model = VQ_Diffusion(config='configs/imagenet.yaml', path='OUTPUT/pretrained_model/imagenet_learnable.pth', imagenet_cf=True)
-    # VQ_Diffusion_model.inference_generate_sample_with_class(407, truncation_rate=0.94, save_root="RESULT", batch_size=4, guidance_scale=1.5)
+            # Usunięcie pustego folderu po przeniesieniu
+            shutil.rmtree(result_dir)
+        else:
+            print(f"⚠ Brak folderu wynikowego dla '{caption}'")
