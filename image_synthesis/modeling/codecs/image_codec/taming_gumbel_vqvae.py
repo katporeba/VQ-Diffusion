@@ -49,7 +49,7 @@ class Decoder(nn.Module):
 
 class TamingFFHQVQVAE(BaseCodec):
     def __init__(
-            self, 
+            self,
             trainable=False,
             token_shape=[16,16],
             config_path='OUTPUT/pretrained_model/taming_dvae/vqgan_ffhq_f16_1024.yaml',
@@ -120,7 +120,7 @@ class TamingFFHQVQVAE(BaseCodec):
 
     def decode(self, img_seq):
         if self.quantize_number != 0:
-            img_seq=self.quantize_to_full[img_seq].type_as(img_seq)
+            img_seq = self.quantize_to_full.to(img_seq.device)[img_seq].type_as(img_seq)
         b, n = img_seq.shape
         img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(math.sqrt(n)))
 
@@ -131,7 +131,7 @@ class TamingFFHQVQVAE(BaseCodec):
 
 class TamingVQVAE(BaseCodec):
     def __init__(
-            self, 
+            self,
             trainable=False,
             token_shape=[16,16],
             config_path='OUTPUT/pretrained_model/taming_dvae/vqgan_imagenet_f16_16384.yaml',
@@ -199,7 +199,7 @@ class TamingVQVAE(BaseCodec):
 
     def decode(self, img_seq):
         if self.quantize_number != 0:
-            img_seq=self.quantize_to_full[img_seq].type_as(img_seq)
+            img_seq = self.quantize_to_full.to(img_seq.device)[img_seq].type_as(img_seq)
         b, n = img_seq.shape
         img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(math.sqrt(n)))
 
@@ -209,7 +209,7 @@ class TamingVQVAE(BaseCodec):
 
 class TamingGumbelVQVAE(BaseCodec):
     def __init__(
-            self, 
+            self,
             trainable=False,
             token_shape=[32,32],
             config_path='OUTPUT/pretrained_model/taming_dvae/taming_f8_8192_openimages.yaml',
@@ -277,7 +277,7 @@ class TamingGumbelVQVAE(BaseCodec):
 
     def decode(self, img_seq):
         if self.quantize_number != 0:
-            img_seq=self.quantize_to_full[img_seq].type_as(img_seq)
+          img_seq = self.quantize_to_full.to(img_seq.device)[img_seq].type_as(img_seq)
         b, n = img_seq.shape
         img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(math.sqrt(n)))
 
