@@ -1,146 +1,286 @@
-# change from o4
-model:
-  target: image_synthesis.modeling.models.dalle.DALLE
-  params:
-    content_info: {key: image}
-    condition_info: {key: text}
-    content_codec_config: 
-    # target: image_synthesis.modeling.codecs.image_codec.openai_dvae.OpenAIDiscreteVAE
-      target: image_synthesis.modeling.codecs.image_codec.taming_gumbel_vqvae.TamingGumbelVQVAE
-      params:
-        trainable: False
-        token_shape: [32, 32]
-        config_path: 'OUTPUT/pretrained_model/taming_dvae/taming_f8_8192_openimages.yaml'
-        ckpt_path: 'OUTPUT/pretrained_model/taming_dvae/taming_f8_8192_openimages_last.pth'
-        num_tokens: 8192
-        quantize_number: 2887
-        mapping_path: './help_folder/statistics/taming_vqvae_2887.pt'
-        # return_logits: True
-    condition_codec_config:
-      target: image_synthesis.modeling.codecs.text_codec.tokenize.Tokenize
-      params:
-       context_length: 77     ############# 77 for clip and 256 for dalle
-       add_start_and_end: True
-       with_mask: True
-       pad_value: 0 # 0 for clip embedding and -100 for others
-       clip_embedding: False     ############################   if we use clip embedding 
-       tokenizer_config:
-        target: image_synthesis.modeling.modules.clip.simple_tokenizer.SimpleTokenizer   #########
-        params:
-          end_idx: 49152                              ###################
-    diffusion_config:      
-    # target: image_synthesis.modeling.transformers.gpt_like_transformer.GPTLikeTransformer
-      target: image_synthesis.modeling.transformers.diffusion_transformer.DiffusionTransformer
-      params:
-        diffusion_step: 100
-        alpha_init_type: 'alpha1'       # init_type = fix or cos or linear 
-        auxiliary_loss_weight: 5.0e-4
-        adaptive_auxiliary_loss: True
-        mask_weight: [1, 1]    # the loss weight on mask region and non-mask region
+import torch
+import torch.nn as nn
+from omegaconf import OmegaConf
+import sys
+sys.path.append("..")
+# sys.path.append("../image_synthesis")
+from image_synthesis.utils.misc import instantiate_from_config
+from image_synthesis.taming.models.vqgan import GumbelVQ, VQModel
+from image_synthesis.taming.models.cond_transformer import Net2NetTransformer
+import os
+import torchvision.transforms.functional as TF
+import PIL
+from image_synthesis.modeling.codecs.base_codec import BaseCodec
+from einops import rearrange
+import math
 
-        transformer_config:
-          target: image_synthesis.modeling.transformers.transformer_utils.Text2ImageTransformer
-          params:
-            attn_type: 'selfcross'
-            n_layer: 19
-            condition_seq_len: 77    ###### 77 for clip and 256 for dalle
-            content_seq_len: 1024  # 32 x 32
-            content_spatial_size: [32, 32]
-            n_embd: 1024 # the dim of embedding dims
-            condition_dim: 512
-            n_head: 16 
-            attn_pdrop: 0.0
-            resid_pdrop: 0.0
-            block_activate: GELU2
-            timestep_type: 'adalayernorm'    # adainsnorm or adalayernorm and abs
-            mlp_hidden_times: 4
-        condition_emb_config:
-          target: image_synthesis.modeling.embeddings.clip_text_embedding.CLIPTextEmbedding
-          params:
-            clip_name: 'ViT-B/32'
-            num_embed: 49408 # 49152+256
-            normalize: True
-            pick_last_embedding: False   # if True same as clip but we need embedding of each word
-            keep_seq_len_dim: False
-            additional_last_embedding: False
-            embed_dim: 512
-        content_emb_config:
-          target: image_synthesis.modeling.embeddings.dalle_mask_image_embedding.DalleMaskImageEmbedding
-          params:
-            num_embed: 2887
-            spatial_size: !!python/tuple [32, 32]
-            embed_dim: 1024
-            trainable: True
-            pos_emb_type: embedding
+class Encoder(nn.Module):
+    def __init__(self, encoder, quant_conv, quantize):
+        super().__init__()
+        self.encoder = encoder
+        self.quant_conv = quant_conv
+        self.quantize = quantize
 
-solver:
-  base_lr: 3.0e-6
-  adjust_lr: none # not adjust lr according to total batch_size
-  max_epochs: 100
-  save_epochs: 2
-  validation_epochs: 5
-  sample_iterations: epoch  # epoch #30000      # how many iterations to perform sampling once ?
-  print_specific_things: True
+    @torch.no_grad()
+    def forward(self, x):
+        x = 2*x - 1
+        h = self.encoder(x)
+        h = self.quant_conv(h)
+        quant, _, [_, _, indices] = self.quantize(h)
+        return indices.view(x.shape[0], -1)
 
-  # config for ema
-  ema:
-    decay: 0.99
-    update_interval: 25
-    device: cpu
+class Decoder(nn.Module):
+    def __init__(self, decoder, post_quant_conv, quantize, w=16, h=16):
+        super().__init__()
+        self.decoder = decoder
+        self.post_quant_conv = post_quant_conv
+        self.quantize = quantize
+        self.w = w
+        self.h = h
 
-  clip_grad_norm:
-    target: image_synthesis.engine.clip_grad_norm.ClipGradNorm
-    params:
-      start_iteration: 0
-      end_iteration: 5000
-      max_norm: 0.5
-  optimizers_and_schedulers: # a list of configures, so we can config several optimizers and schedulers
-  - name: none # default is None
-    optimizer:
-      target: torch.optim.AdamW
-      params: 
-        betas: !!python/tuple [0.9, 0.96]
-        weight_decay: 4.5e-2
-            # target: ZeroRedundancyOptimizer
-            # optimizer_class: torch.optim.AdamW
-            # params:
-            # betas: !!python/tuple [0.9, 0.96]
-            # weight_decay: 4.5e-2
-    scheduler:
-      step_iteration: 1
-      target: image_synthesis.engine.lr_scheduler.ReduceLROnPlateauWithWarmup
-      params:
-        factor: 0.5
-        patience: 60000
-        min_lr: 1.0e-6
-        threshold: 1.0e-1
-        threshold_mode: rel
-        warmup_lr: 2.0e-4 # the lr to be touched after warmup
-        warmup: 1000 
+    @torch.no_grad()
+    def forward(self, indices):
+        z = self.quantize.get_codebook_entry(indices.view(-1), shape=(indices.shape[0], self.h, self.w, -1))
+        quant = self.post_quant_conv(z)
+        dec = self.decoder(quant)
+        x = torch.clamp(dec, -1., 1.)
+        x = (x + 1.)/2.
+        return x
 
-dataloader:
-  # data_root: data
-  data_root: /mnt/blob/datasets/MSCOCO_Caption
-  batch_size: 4
-  num_workers: 4
-  train_datasets: # a list of configures, so we can combine several schedulers
-    - target: image_synthesis.data.mscoco_dataset.CocoDataset
-      params:
-        data_root: /mnt/blob/datasets/MSCOCO_Caption
-        phase: train
-        drop_caption_rate: 0.0
-        im_preprocessor_config:
-          target: image_synthesis.data.utils.image_preprocessor.DalleTransformerPreprocessor   # ImageNet
-          params:
-            size: 256
-            phase: train
-  validation_datasets:
-    - target: image_synthesis.data.mscoco_dataset.CocoDataset
-      params:
-        data_root: /mnt/blob/datasets/MSCOCO_Caption
-        phase: val
-        im_preprocessor_config:
-          target: image_synthesis.data.utils.image_preprocessor.DalleTransformerPreprocessor
-          params:
-            size: 256
-            phase: val
+class TamingFFHQVQVAE(BaseCodec):
+    def __init__(
+            self,
+            trainable=False,
+            token_shape=[16,16],
+            config_path='OUTPUT/pretrained_model/taming_dvae/vqgan_ffhq_f16_1024.yaml',
+            ckpt_path='OUTPUT/pretrained_model/taming_dvae/vqgan_ffhq_f16_1024.pth',
+            num_tokens=1024,
+            quantize_number=0,
+            mapping_path=None,
+        ):
+        super().__init__()
+        
+        model = self.LoadModel(config_path, ckpt_path)
+
+        self.enc = Encoder(model.encoder, model.quant_conv, model.quantize)
+        self.dec = Decoder(model.decoder, model.post_quant_conv, model.quantize, token_shape[0], token_shape[1])
+
+        self.num_tokens = num_tokens
+        self.quantize_number = quantize_number
+        if self.quantize_number != 0 and mapping_path!=None:
+            self.full_to_quantize = torch.load(mapping_path)
+            self.quantize_to_full = torch.zeros(self.quantize_number)-1
+            for idx, i in enumerate(self.full_to_quantize):
+                if self.quantize_to_full[i] == -1:
+                    self.quantize_to_full[i] = idx
+            self.quantize_to_full = self.quantize_to_full.long()
+    
+        self.trainable = trainable
+        self.token_shape = token_shape
+        self._set_trainable()
+
+    def LoadModel(self, config_path, ckpt_path):
+        config = OmegaConf.load(config_path)
+        # model = instantiate_from_config(config.model)
+        model = Net2NetTransformer(**config.model.params)
+        sd = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        model.load_state_dict(sd, strict=False)
+        if (isinstance(model, Net2NetTransformer)):
+            model = model.first_stage_model
+        return model
+
+    @property
+    def device(self):
+        # import pdb; pdb.set_trace()
+        return self.enc.quant_conv.weight.device
+
+    def preprocess(self, imgs):
+        """
+        imgs: B x C x H x W, in the range 0-255
+        """
+        imgs = imgs.div(255) # map to 0 - 1
+        return imgs
+        # return map_pixels(imgs)   
+    
+    def postprocess(self, imgs):
+        """
+        imgs: B x C x H x W, in the range 0-1
+        """
+        imgs = imgs * 255
+        return imgs
+
+    def get_tokens(self, imgs, **kwargs):
+        imgs = self.preprocess(imgs)
+        code = self.enc(imgs)
+        if self.quantize_number != 0:
+            code = self.full_to_quantize[code]
+        output = {'token': code}
+        # output = {'token': rearrange(code, 'b h w -> b (h w)')}
+        return output
+
+    def decode(self, img_seq):
+        if self.quantize_number != 0:
+            img_seq = self.quantize_to_full.to(img_seq.device)[img_seq].type_as(img_seq)
+        b, n = img_seq.shape
+        img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(math.sqrt(n)))
+
+        x_rec = self.dec(img_seq)
+        x_rec = self.postprocess(x_rec)
+        return x_rec
+
+
+class TamingVQVAE(BaseCodec):
+    def __init__(
+            self,
+            trainable=False,
+            token_shape=[16,16],
+            config_path='OUTPUT/pretrained_model/taming_dvae/vqgan_imagenet_f16_16384.yaml',
+            ckpt_path='OUTPUT/pretrained_model/taming_dvae/vqgan_imagenet_f16_16384.pth',
+            num_tokens=16384,
+            quantize_number=974,
+            mapping_path='./help_folder/statistics/taming_vqvae_974.pt',
+        ):
+        super().__init__()
+        
+        model = self.LoadModel(config_path, ckpt_path)
+
+        self.enc = Encoder(model.encoder, model.quant_conv, model.quantize)
+        self.dec = Decoder(model.decoder, model.post_quant_conv, model.quantize, token_shape[0], token_shape[1])
+
+        self.num_tokens = num_tokens
+        self.quantize_number = quantize_number
+        if self.quantize_number != 0 and mapping_path!=None:
+            self.full_to_quantize = torch.load(mapping_path)
+            self.quantize_to_full = torch.zeros(self.quantize_number)-1
+            for idx, i in enumerate(self.full_to_quantize):
+                if self.quantize_to_full[i] == -1:
+                    self.quantize_to_full[i] = idx
+            self.quantize_to_full = self.quantize_to_full.long()
+    
+        self.trainable = trainable
+        self.token_shape = token_shape
+        self._set_trainable()
+
+    def LoadModel(self, config_path, ckpt_path):
+        config = OmegaConf.load(config_path)
+        model = VQModel(**config.model.params)
+        sd = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        model.load_state_dict(sd, strict=False)
+        return model
+
+    @property
+    def device(self):
+        # import pdb; pdb.set_trace()
+        return self.enc.quant_conv.weight.device
+
+    def preprocess(self, imgs):
+        """
+        imgs: B x C x H x W, in the range 0-255
+        """
+        imgs = imgs.div(255) # map to 0 - 1
+        return imgs
+        # return map_pixels(imgs)   
+    
+    def postprocess(self, imgs):
+        """
+        imgs: B x C x H x W, in the range 0-1
+        """
+        imgs = imgs * 255
+        return imgs
+
+    def get_tokens(self, imgs, **kwargs):
+        imgs = self.preprocess(imgs)
+        code = self.enc(imgs)
+        if self.quantize_number != 0:
+            code = self.full_to_quantize[code]
+        output = {'token': code}
+        # output = {'token': rearrange(code, 'b h w -> b (h w)')}
+        return output
+
+    def decode(self, img_seq):
+        if self.quantize_number != 0:
+            img_seq = self.quantize_to_full.to(img_seq.device)[img_seq].type_as(img_seq)
+        b, n = img_seq.shape
+        img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(math.sqrt(n)))
+
+        x_rec = self.dec(img_seq)
+        x_rec = self.postprocess(x_rec)
+        return x_rec
+
+class TamingGumbelVQVAE(BaseCodec):
+    def __init__(
+            self,
+            trainable=False,
+            token_shape=[32,32],
+            config_path='OUTPUT/pretrained_model/taming_dvae/taming_f8_8192_openimages.yaml',
+            ckpt_path='OUTPUT/pretrained_model/taming_dvae/taming_f8_8192_openimages_last.pth',
+            num_tokens=8192,
+            quantize_number=2887,
+            mapping_path='./help_folder/statistics/taming_vqvae_2887.pt',
+        ):
+        super().__init__()
+        
+        model = self.LoadModel(config_path, ckpt_path)
+
+        self.enc = Encoder(model.encoder, model.quant_conv, model.quantize)
+        self.dec = Decoder(model.decoder, model.post_quant_conv, model.quantize, token_shape[0], token_shape[1])
+
+        self.num_tokens = num_tokens
+        self.quantize_number = quantize_number
+        if self.quantize_number != 0 and mapping_path!=None:
+            self.full_to_quantize = torch.load(mapping_path)
+            self.quantize_to_full = torch.zeros(self.quantize_number)-1
+            for idx, i in enumerate(self.full_to_quantize):
+                if self.quantize_to_full[i] == -1:
+                    self.quantize_to_full[i] = idx
+            self.quantize_to_full = self.quantize_to_full.long()
+    
+        self.trainable = trainable
+        self.token_shape = token_shape
+        self._set_trainable()
+
+    def LoadModel(self, config_path, ckpt_path):
+        config = OmegaConf.load(config_path)
+        model = GumbelVQ(**config.model.params)
+        sd = torch.load(ckpt_path, map_location="cpu")["state_dict"]
+        model.load_state_dict(sd, strict=False)
+        return model
+
+    @property
+    def device(self):
+        # import pdb; pdb.set_trace()
+        return self.enc.quant_conv.weight.device
+
+    def preprocess(self, imgs):
+        """
+        imgs: B x C x H x W, in the range 0-255
+        """
+        imgs = imgs.div(255) # map to 0 - 1
+        return imgs
+        # return map_pixels(imgs)   
+    
+    def postprocess(self, imgs):
+        """
+        imgs: B x C x H x W, in the range 0-1
+        """
+        imgs = imgs * 255
+        return imgs
+
+    def get_tokens(self, imgs, **kwargs):
+        imgs = self.preprocess(imgs)
+        code = self.enc(imgs)
+        if self.quantize_number != 0:
+            code = self.full_to_quantize[code]
+        output = {'token': code}
+        # output = {'token': rearrange(code, 'b h w -> b (h w)')}
+        return output
+
+    def decode(self, img_seq):
+        if self.quantize_number != 0:
+          img_seq = self.quantize_to_full.to(img_seq.device)[img_seq].type_as(img_seq)
+        b, n = img_seq.shape
+        img_seq = rearrange(img_seq, 'b (h w) -> b h w', h = int(math.sqrt(n)))
+
+        x_rec = self.dec(img_seq)
+        x_rec = self.postprocess(x_rec)
+        return x_rec
