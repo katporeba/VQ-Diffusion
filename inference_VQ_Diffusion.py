@@ -172,7 +172,7 @@ if __name__ == '__main__':
     )
 
     for idx, (caption, img_id) in enumerate(zip(captions, image_ids)):
-        if idx < 2432:
+        if idx < 3066:
           continue
         print(f"[{idx+1}/{len(captions)}] Generuję obrazy dla: '{caption}'")
 
