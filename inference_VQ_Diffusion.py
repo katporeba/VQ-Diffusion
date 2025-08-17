@@ -149,9 +149,9 @@ class VQ_Diffusion():
 
 
 if __name__ == '__main__':
-    captions_path = "/kaggle/working/fixed_captions.txt"
-    ids_path = "/kaggle/working/fixed_image_ids.txt"
-    output_dir = "/kaggle/working/output"
+    captions_path = "/content/fixed_captions.txt"
+    ids_path = "/content/fixed_image_ids.txt"
+    output_dir = "/content/drive/MyDrive/vq-diffusion-latency"
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -167,23 +167,23 @@ if __name__ == '__main__':
 
     # Ładowanie modelu
     VQ_Diffusion_model = VQ_Diffusion(
-        config='/kaggle/working/VQ-Diffusion/configs/coco.yaml',
-        path='/kaggle/working/coco_pretrained.pth'
+        config='/content/VQ-Diffusion/configs/coco.yaml',
+        path='/content/coco_pretrained.pth'
     )
 
     for idx, (caption, img_id) in enumerate(zip(captions, image_ids)):
-        if idx < 2570:
+        if idx < 4000:
           continue
         print(f"[{idx+1}/{len(captions)}] Generuję obrazy dla: '{caption}'")
 
         # Ścieżka do folderu wynikowego
-        result_dir = f"/kaggle/working/VQ-Diffusion/RESULT/{caption}"
+        result_dir = f"/content/VQ-Diffusion/RESULT/{caption}"
 
         # Generowanie 5 obrazów
         VQ_Diffusion_model.inference_generate_sample_with_condition(
             caption,
             truncation_rate=0.85,
-            save_root="/kaggle/working/VQ-Diffusion/RESULT",
+            save_root="/content/VQ-Diffusion/RESULT",
             batch_size=5,
             fast=2
         )
