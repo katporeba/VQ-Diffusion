@@ -184,7 +184,7 @@ if __name__ == '__main__':
             caption,
             truncation_rate=0.85,
             save_root="/content/VQ-Diffusion/RESULT",
-            batch_size=5,
+            batch_size=2,
             fast=2
         )
 
